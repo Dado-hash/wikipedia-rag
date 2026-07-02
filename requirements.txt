@@ -8,3 +8,8 @@ streamlit>=1.40.0
 tqdm>=4.60.0
 mwparserfromhell>=0.7.0
 requests>=2.30.0
+
+# Optional: faster ONNX backend for small embedding models.
+# Enable by setting EMBEDDING_BACKEND = "onnx" in config.py.
+# optimum>=1.3.0
+# onnxruntime>=1.16.0

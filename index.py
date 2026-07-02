@@ -1,111 +1,197 @@
 #!/usr/bin/env python3
+"""Chunk articles, embed, and store in ChromaDB.
+
+Pipeline (parallel):
+  producer thread  ->  read JSONL + chunk + skip-already-embedded
+  embed worker(s)  ->  embed_documents() (runs on MPS / CPU / ONNX)
+  main (store)     ->  drain + upsert to ChromaDB every STORAGE_FLUSH_SIZE chunks
+
+Resume: chunk ids are deterministic (hash(title) :: chunk_index), so re-runs
+skip articles that are already present in the collection. `--reset` wipes first.
+"""
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
 
+import argparse
+import hashlib
 import json
 import os
+import queue
 import shutil
+import threading
 import time
-import uuid
 
 import chromadb
-import config
-from tqdm import tqdm
+import numpy as np
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from tqdm import tqdm
+
+import config
 from embeddings import LocalEmbeddings, LMStudioEmbeddings
 
 
+def stable_hash(title: str) -> str:
+    """Deterministic chunk id prefix from the article title (<=128 chars after suffix)."""
+    return hashlib.blake2b(title.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def chunk_id(title: str, idx: int) -> str:
+    return f"{stable_hash(title)}::{idx}"
+
+
+def build_embedder():
+    if config.USE_LOCAL_EMBEDDING:
+        return LocalEmbeddings(
+            use_fp16=config.EMBEDDING_USE_FP16,
+            backend=getattr(config, "EMBEDDING_BACKEND", "torch"),
+            encode_batch_size=config.EMBEDDING_BATCH_SIZE,
+        )
+    return LMStudioEmbeddings(model=config.EMBEDDING_MODEL, base_url=config.LM_STUDIO_URL)
+
+
+def embed_worker(in_q, out_q, embedder, errors):
+    """Pull batches from in_q, embed, push (ids, metas, docs, vectors) to out_q."""
+    while True:
+        batch = in_q.get()
+        if batch is None:
+            out_q.put(None)
+            in_q.task_done()
+            return
+        try:
+            texts = [b[3] for b in batch]
+            vectors = embedder.embed_documents(texts)  # np.float32 2D
+            ids = [b[0] for b in batch]
+            metas = [{"title": b[1], "url": b[2]} for b in batch]
+            docs = texts
+            out_q.put((ids, metas, docs, vectors))
+        except Exception as e:  # noqa: BLE001 - surface to main thread
+            errors.append(e)
+            out_q.put(None)
+            in_q.task_done()
+            return
+        in_q.task_done()
+
+
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description='Chunk articles, embed, store in ChromaDB')
-    parser.add_argument('--reset', action='store_true', help='Delete existing chroma_db and re-index')
+    parser = argparse.ArgumentParser(description="Chunk articles, embed, store in ChromaDB")
+    parser.add_argument("--reset", action="store_true",
+                        help="Delete existing chroma_db and re-index from scratch")
     args = parser.parse_args()
 
     if args.reset and os.path.exists(config.CHROMA_DB_DIR):
         shutil.rmtree(config.CHROMA_DB_DIR)
-        print(f'Deleted {config.CHROMA_DB_DIR}/')
+        print(f"Deleted {config.CHROMA_DB_DIR}/")
 
-    print('Loading articles...')
     with open(config.ARTICLES_FILE) as f:
-        articles = [json.loads(line) for line in f]
-    print(f'  {len(articles)} articles loaded')
+        n_articles = sum(1 for _ in f)
+    print(f"{n_articles} articles found")
 
-    print('Chunking...')
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=config.CHUNK_SIZE,
         chunk_overlap=config.CHUNK_OVERLAP,
-        separators=['\n\n', '\n', '. ', ' ', ''],
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
 
-    chunks = []
-    for art in tqdm(articles, desc='Chunking', unit='article'):
-        texts = splitter.split_text(art['text'])
-        for t in texts:
-            chunks.append({
-                'title': art['title'],
-                'url': art['url'],
-                'text': t,
-            })
-
-    print(f'  {len(chunks)} chunks created')
-
-    print(f'Loading embeddings...')
-    if config.USE_LOCAL_EMBEDDING:
-        embedder = LocalEmbeddings(use_fp16=config.EMBEDDING_USE_FP16)
-    else:
-        embedder = LMStudioEmbeddings(
-            model=config.EMBEDDING_MODEL,
-            base_url=config.LM_STUDIO_URL,
-        )
-
-    texts = [c['text'] for c in chunks]
-
-    print(f'Phase 1: Embedding {len(chunks)} chunks...')
-    start = time.time()
-
-    pbar = tqdm(total=len(chunks), unit='chunk', desc='Embedding')
-    batch_size = config.EMBEDDING_BATCH_SIZE
-    vectors = []
-    for i in range(0, len(chunks), batch_size):
-        batch = texts[i:i + batch_size]
-        batch_vecs = embedder.embed_documents(batch)
-        vectors.extend(batch_vecs)
-        pbar.update(len(batch))
-        elapsed = time.time() - start
-        done = i + len(batch)
-        rate = done / elapsed if elapsed > 0 else 0
-        remaining = (len(chunks) - done) / rate if rate > 0 else 0
-        pbar.set_postfix(rate=f'{rate:.0f} ch/s', eta=f'{remaining:.0f}s')
-    pbar.close()
-
-    embed_elapsed = time.time() - start
-    print(f'  Done in {embed_elapsed:.1f}s ({len(chunks)/embed_elapsed:.0f} chunks/s)')
-
-    print(f'Phase 2: Storing in ChromaDB...')
-    store_start = time.time()
+    print("Loading embedder...")
+    embedder = build_embedder()
 
     client = chromadb.PersistentClient(path=config.CHROMA_DB_DIR)
     collection = client.get_or_create_collection("langchain")
 
-    ids = [str(uuid.uuid4()) for _ in chunks]
-    metadatas = [{'title': c['title'], 'url': c['url']} for c in chunks]
+    # Load existing chunk ids once: lets us skip already-embedded articles on resume.
+    existing_ids = set()
+    if not args.reset:
+        fetched = collection.get(include=[])
+        existing_ids = set(fetched.get("ids", []))
+        print(f"Resume: {len(existing_ids)} chunks already in collection")
 
-    batch_sz = 5000
-    for i in tqdm(range(0, len(chunks), batch_sz), desc='Storing', unit='batch'):
-        batch_end = min(i + batch_sz, len(chunks))
-        collection.add(
-            ids=ids[i:batch_end],
-            embeddings=vectors[i:batch_end],
-            metadatas=metadatas[i:batch_end],
-            documents=texts[i:batch_end],
+    qmax = getattr(config, "QUEUE_MAXSIZE", 4)
+    batch_q = queue.Queue(maxsize=qmax)
+    store_q = queue.Queue(maxsize=qmax)
+    errors = []
+
+    pbar = tqdm(total=n_articles, unit="art", desc="Indexing")
+    start = time.time()
+
+    # --- Producer thread: read + chunk + skip ---
+    def run_producer():
+        batch = []
+        with open(config.ARTICLES_FILE) as f:
+            for line in f:
+                if errors:
+                    break
+                art = json.loads(line)
+                title = art["title"]
+                url = art["url"]
+                texts = splitter.split_text(art["text"])
+                # Skip whole article if its last chunk is already stored.
+                if texts and chunk_id(title, len(texts) - 1) in existing_ids:
+                    pbar.update(1)
+                    continue
+                for idx, t in enumerate(texts):
+                    batch.append((chunk_id(title, idx), title, url, t))
+                    if len(batch) >= config.EMBEDDING_BATCH_SIZE:
+                        batch_q.put(batch)
+                        batch = []
+                pbar.update(1)
+        if batch:
+            batch_q.put(batch)
+        batch_q.put(None)
+
+    p_thread = threading.Thread(target=run_producer, name="producer")
+    p_thread.start()
+
+    # --- Embed worker thread(s) ---
+    n_workers = max(1, getattr(config, "PARALLEL_EMBED_WORKERS", 1))
+    workers = []
+    for i in range(n_workers):
+        t = threading.Thread(target=embed_worker, args=(batch_q, store_q, embedder, errors),
+                             name=f"embed-{i}", daemon=True)
+        t.start()
+        workers.append(t)
+
+    # --- Main: store (drain store_q, flush every STORAGE_FLUSH_SIZE) ---
+    flush_size = getattr(config, "STORAGE_FLUSH_SIZE", 5000)
+    s_ids, s_metas, s_docs, s_vecs = [], [], [], []
+    chunks_done = 0
+    sentinels_seen = 0
+
+    def flush():
+        if not s_ids:
+            return
+        collection.upsert(
+            ids=s_ids,
+            embeddings=np.vstack(s_vecs),
+            metadatas=s_metas,
+            documents=s_docs,
         )
+        s_ids.clear(); s_metas.clear(); s_docs.clear(); s_vecs.clear()
 
-    store_elapsed = time.time() - store_start
+    while sentinels_seen < n_workers:
+        item = store_q.get()
+        if item is None:
+            sentinels_seen += 1
+            continue
+        ids, metas, docs, vectors = item
+        s_ids.extend(ids)
+        s_metas.extend(metas)
+        s_docs.extend(docs)
+        s_vecs.append(vectors)
+        chunks_done += len(ids)
+        if len(s_ids) >= flush_size:
+            flush()
+
+    flush()  # final partial batch
+    p_thread.join()
+    pbar.close()
+
+    if errors:
+        raise errors[0]
+
     total = time.time() - start
-    print(f'  Storage done in {store_elapsed:.1f}s ({len(chunks)/store_elapsed:.0f} chunks/s)')
-    print(f'\nDone! {len(chunks)} chunks indexed in {total:.1f}s total')
-    print(f'  Embed: {embed_elapsed:.1f}s | Store: {store_elapsed:.1f}s')
+    rate = chunks_done / total if total else 0
+    print(f"Done! {chunks_done} chunks embedded+stored in {total:.1f}s ({rate:.0f} chunks/s)")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

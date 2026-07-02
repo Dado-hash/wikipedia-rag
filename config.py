@@ -13,3 +13,12 @@ ARTICLES_FILE = "articles.jsonl"
 USE_LOCAL_EMBEDDING = True
 EMBEDDING_USE_FP16 = True
 EMBEDDING_BATCH_SIZE = 512
+
+# Embedding backend: "torch" (default) or "onnx" (faster for small models on CPU).
+# "onnx" requires: pip install optimum onnxruntime
+EMBEDDING_BACKEND = "torch"
+
+# Parallel indexing pipeline (producer/embed/store threads).
+PARALLEL_EMBED_WORKERS = 1   # embed worker threads (keep 1, MPS doesn't multi-process well)
+QUEUE_MAXSIZE = 4            # bounded queue size between stages (backpressure)
+STORAGE_FLUSH_SIZE = 5000    # upsert to ChromaDB every N embedded chunks

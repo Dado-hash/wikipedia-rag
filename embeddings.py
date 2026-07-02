@@ -1,4 +1,6 @@
 from typing import List
+
+import numpy as np
 from langchain_core.embeddings import Embeddings
 import requests
 import torch
@@ -22,14 +24,42 @@ class LMStudioEmbeddings(Embeddings):
 
 
 class LocalEmbeddings(Embeddings):
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2", use_fp16: bool = True):
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-        self.model = SentenceTransformer(model_name, device=device)
-        if use_fp16 and device == "mps":
-            self.model.half()
+    """Sentence-transformers embeddings, with optional ONNX backend.
 
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return self.model.encode(texts, show_progress_bar=False, batch_size=512).tolist()
+    `embed_documents` returns a contiguous `np.float32` 2D array (one row per
+    text) so callers can stack/flush them to ChromaDB without per-element
+    Python conversion. `embed_query` returns a plain list for query-time
+    compatibility with LangChain/Chroma.
+    """
+
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", use_fp16: bool = True,
+                 backend: str = "torch", encode_batch_size: int = 512):
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        if backend == "onnx":
+            # ONNX Runtime on macOS arm64 only ships CPUExecutionProvider in the
+            # standard wheel; force CPU so the model runs on the optimized kernels.
+            device = "cpu"
+            self.model = SentenceTransformer(
+                model_name, device=device, backend="onnx",
+                provider="CPUExecutionProvider",
+            )
+        elif backend == "torch":
+            self.model = SentenceTransformer(model_name, device=device)
+            if use_fp16 and device == "mps":
+                self.model.half()
+        else:
+            raise ValueError(f"Unknown backend: {backend!r} (use 'torch' or 'onnx')")
+        self._encode_batch_size = encode_batch_size
+
+    def embed_documents(self, texts: List[str]) -> np.ndarray:
+        # encode() already returns an np.ndarray; cast to float32 (cheap, vectorized)
+        # instead of .tolist() which would build ~200k Python floats per 512-batch.
+        emb = self.model.encode(
+            texts, show_progress_bar=False,
+            batch_size=self._encode_batch_size,
+        )
+        return np.ascontiguousarray(emb, dtype=np.float32)
 
     def embed_query(self, text: str) -> List[float]:
-        return self.model.encode(text, show_progress_bar=False).tolist()
+        emb = self.model.encode(text, show_progress_bar=False)
+        return emb.astype(np.float32).tolist()
