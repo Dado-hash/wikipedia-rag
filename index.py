@@ -81,7 +81,7 @@ def main():
     embed_elapsed = time.time() - start
     print(f'  Done in {embed_elapsed:.1f}s ({len(chunks)/embed_elapsed:.0f} chunks/s)')
 
-    print(f'Phase 2: Bulk storing in ChromaDB...')
+    print(f'Phase 2: Storing in ChromaDB...')
     store_start = time.time()
 
     client = chromadb.PersistentClient(path=config.CHROMA_DB_DIR)
@@ -90,12 +90,15 @@ def main():
     ids = [str(uuid.uuid4()) for _ in chunks]
     metadatas = [{'title': c['title'], 'url': c['url']} for c in chunks]
 
-    collection.add(
-        ids=ids,
-        embeddings=vectors,
-        metadatas=metadatas,
-        documents=texts,
-    )
+    batch_sz = 5000
+    for i in tqdm(range(0, len(chunks), batch_sz), desc='Storing', unit='batch'):
+        batch_end = min(i + batch_sz, len(chunks))
+        collection.add(
+            ids=ids[i:batch_end],
+            embeddings=vectors[i:batch_end],
+            metadatas=metadatas[i:batch_end],
+            documents=texts[i:batch_end],
+        )
 
     store_elapsed = time.time() - store_start
     total = time.time() - start
