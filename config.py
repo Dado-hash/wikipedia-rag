@@ -25,7 +25,14 @@ EMBEDDING_BATCH_SIZE = 512
 # "onnx" requires: pip install optimum onnxruntime
 EMBEDDING_BACKEND = "torch"
 
+# HNSW index tuning — lower ef_construction = faster bulk inserts.
+# Default ChromaDB is 100; 40 is ~2× faster insert during bulk load.
+HNSW_EF_CONSTRUCTION = 40
+
 # Parallel indexing pipeline (producer/embed/store threads).
 PARALLEL_EMBED_WORKERS = 1   # embed worker threads (keep 1, MPS doesn't multi-process well)
 QUEUE_MAXSIZE = 4            # bounded queue size between stages (backpressure)
 STORAGE_FLUSH_SIZE = 5000    # upsert to ChromaDB every N embedded chunks
+
+# Persist processed_titles cache to disk every N flushes (reduce lock / I/O pressure).
+SAVE_INTERVAL = 5

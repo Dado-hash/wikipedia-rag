@@ -31,7 +31,7 @@ Estrae articoli da `enwiki-latest-pages-articles.xml.bz2`, pulisce il wikitext, 
 
 ```bash
 python3 index.py --reset
-python3 index.py --encode-batch-size=1024 --flush-size=2000   # tuning
+python3 index.py --encode-batch-size=2048 --flush-size=10000 --hnsw-ef=40   # tuning
 ```
 
 - **Chunking**: `RecursiveCharacterTextSplitter` (2000 caratteri, overlap 200)
@@ -43,10 +43,15 @@ CLI disponibili:
 - `--reset`: ricrea l'indice da capo
 - `--encode-batch-size N`: sovrascrive `EMBEDDING_BATCH_SIZE` (default 512)
 - `--flush-size N`: sovrascrive `STORAGE_FLUSH_SIZE` (default 5000)
+- `--hnsw-ef N`: HNSW `ef_construction` (default 40, più basso = insert più veloci)
+- `--save-interval N`: salva `processed_titles` ogni N flush (default 5, riduce I/O)
 
-> **Tuning**: la configurazione più veloce finora è `--encode-batch-size=2048 --flush-size=10000`.
-> ChromaDB ha un limite di ~5461 elementi per UPSERT, quindi flush anche più grandi vengono
-> automaticamente suddivisi in blocchi da 5000 dal thread store.
+> **Tuning**: la configurazione più veloce finora:
+> ```
+> python3 index.py --reset --encode-batch-size=2048 --flush-size=10000 --hnsw-ef=40
+> ```
+> ChromaDB accetta max ~5461 elementi per UPSERT, flush più grandi vengono suddivisi in blocchi da 5000.
+> Con `--hnsw-ef=40` l'insert HNSW è circa 2× più veloce del default ChromaDB (100).
 
 ### 3. Launch the UI
 
@@ -71,9 +76,11 @@ Tutti i parametri in `config.py`:
 | `CHUNK_SIZE` | `2000` | Caratteri per chunk |
 | `CHUNK_OVERLAP` | `200` | Overlap tra chunk consecutivi |
 | `TOP_K` | `5` | Documenti recuperati per query |
+| `HNSW_EF_CONSTRUCTION` | `40` | HNSW bulk insert speed (default ChromaDB=100) |
 | `PARALLEL_EMBED_WORKERS` | `1` | Thread embed (tenere 1, MPS non multi-processa bene) |
 | `QUEUE_MAXSIZE` | `4` | Code graduate tra stadi (backpressure) |
 | `STORAGE_FLUSH_SIZE` | `5000` | Upsert in ChromaDB ogni N chunk |
+| `SAVE_INTERVAL` | `5` | Persiste processed_titles ogni N flush |
 
 ## Performance (M1 Mac, 5000 articoli, ~194k chunk)
 

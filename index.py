@@ -76,10 +76,16 @@ def main():
                         help=f"Override EMBEDDING_BATCH_SIZE (default {config.EMBEDDING_BATCH_SIZE})")
     parser.add_argument("--flush-size", type=int, default=None,
                         help=f"Override STORAGE_FLUSH_SIZE (default {config.STORAGE_FLUSH_SIZE})")
+    parser.add_argument("--hnsw-ef", type=int, default=None,
+                        help=f"HNSW ef_construction (default {config.HNSW_EF_CONSTRUCTION}, lower=faster insert)")
+    parser.add_argument("--save-interval", type=int, default=None,
+                        help=f"Save processed_titles every N flushes (default {config.SAVE_INTERVAL})")
     args = parser.parse_args()
 
     batch_size = args.encode_batch_size or config.EMBEDDING_BATCH_SIZE
     flush_size = args.flush_size or config.STORAGE_FLUSH_SIZE
+    hnsw_ef = args.hnsw_ef if args.hnsw_ef is not None else config.HNSW_EF_CONSTRUCTION
+    save_interval = args.save_interval if args.save_interval is not None else config.SAVE_INTERVAL
 
     processed_file = "processed_titles.json"
     if args.reset:
@@ -104,7 +110,10 @@ def main():
     embedder = build_embedder(batch_size=batch_size)
 
     client = chromadb.PersistentClient(path=config.CHROMA_DB_DIR)
-    collection = client.get_or_create_collection("langchain")
+    collection = client.get_or_create_collection(
+        "langchain",
+        metadata={"hnsw:construction_ef": hnsw_ef},
+    )
 
     # Load existing chunk ids once: lets us skip already-embedded articles on resume.
     existing_ids = set()
@@ -177,8 +186,16 @@ def main():
     def run_store():
         nonlocal chunks_done
         MAX_UPSERT = 5000  # ponytail: ChromaDB max batch ~5461, stay safe
+        flush_count = 0
+
+        def save_processed():
+            with open(processed_file, "w") as f:
+                with processed_lock:
+                    titles = sorted(processed_titles)
+                json.dump(titles, f)
 
         def do_upsert(ids, metas, docs, vecs):
+            nonlocal flush_count
             all_vecs = np.vstack(vecs)
             for i in range(0, len(ids), MAX_UPSERT):
                 end = i + MAX_UPSERT
@@ -191,10 +208,9 @@ def main():
             with processed_lock:
                 for cid in ids:
                     processed_titles.add(cid.split("::")[0])
-            with open(processed_file, "w") as f:
-                with processed_lock:
-                    titles = sorted(processed_titles)
-                json.dump(titles, f)
+            flush_count += 1
+            if flush_count % save_interval == 0:
+                save_processed()
 
         s_ids, s_metas, s_docs, s_vecs = [], [], [], []
         sentinels_seen = 0
