@@ -35,10 +35,6 @@ def stable_hash(title: str) -> str:
     return hashlib.blake2b(title.encode("utf-8"), digest_size=16).hexdigest()
 
 
-def chunk_id(title: str, idx: int) -> str:
-    return f"{stable_hash(title)}::{idx}"
-
-
 def build_embedder():
     if config.USE_LOCAL_EMBEDDING:
         return LocalEmbeddings(
@@ -78,9 +74,14 @@ def main():
                         help="Delete existing chroma_db and re-index from scratch")
     args = parser.parse_args()
 
-    if args.reset and os.path.exists(config.CHROMA_DB_DIR):
-        shutil.rmtree(config.CHROMA_DB_DIR)
-        print(f"Deleted {config.CHROMA_DB_DIR}/")
+    processed_file = "processed_titles.json"
+    if args.reset:
+        if os.path.exists(config.CHROMA_DB_DIR):
+            shutil.rmtree(config.CHROMA_DB_DIR)
+            print(f"Deleted {config.CHROMA_DB_DIR}/")
+        if os.path.exists(processed_file):
+            os.remove(processed_file)
+            print(f"Deleted {processed_file}")
 
     with open(config.ARTICLES_FILE) as f:
         n_articles = sum(1 for _ in f)
@@ -105,6 +106,14 @@ def main():
         existing_ids = set(fetched.get("ids", []))
         print(f"Resume: {len(existing_ids)} chunks already in collection")
 
+    # Load processed titles cache to avoid re-splitting on resume.
+    processed_titles = set()
+    if os.path.exists(processed_file):
+        with open(processed_file) as f:
+            processed_titles = set(json.load(f))
+    print(f"Processed cache: {len(processed_titles)} articles")
+    processed_lock = threading.Lock()
+
     qmax = getattr(config, "QUEUE_MAXSIZE", 4)
     batch_q = queue.Queue(maxsize=qmax)
     store_q = queue.Queue(maxsize=qmax)
@@ -123,13 +132,19 @@ def main():
                 art = json.loads(line)
                 title = art["title"]
                 url = art["url"]
+                title_hash = stable_hash(title)
+                with processed_lock:
+                    if title_hash in processed_titles:
+                        pbar.update(1)
+                        continue
                 texts = splitter.split_text(art["text"])
-                # Skip whole article if its last chunk is already stored.
-                if texts and chunk_id(title, len(texts) - 1) in existing_ids:
+                if texts and f"{title_hash}::{len(texts) - 1}" in existing_ids:
+                    with processed_lock:
+                        processed_titles.add(title_hash)
                     pbar.update(1)
                     continue
                 for idx, t in enumerate(texts):
-                    batch.append((chunk_id(title, idx), title, url, t))
+                    batch.append((f"{title_hash}::{idx}", title, url, t))
                     if len(batch) >= config.EMBEDDING_BATCH_SIZE:
                         batch_q.put(batch)
                         batch = []
@@ -165,6 +180,13 @@ def main():
             metadatas=s_metas,
             documents=s_docs,
         )
+        with processed_lock:
+            for cid in s_ids:
+                processed_titles.add(cid.split("::")[0])
+        with open(processed_file, "w") as f:
+            with processed_lock:
+                titles = sorted(processed_titles)
+            json.dump(titles, f)
         s_ids.clear(); s_metas.clear(); s_docs.clear(); s_vecs.clear()
 
     while sentinels_seen < n_workers:
@@ -183,6 +205,13 @@ def main():
 
     flush()  # final partial batch
     p_thread.join()
+    # Persist any entries learned by the producer (articles whose
+    # last chunk was already in the collection but whose hash wasn't
+    # yet in processed_titles).
+    with open(processed_file, "w") as f:
+        with processed_lock:
+            titles = sorted(processed_titles)
+        json.dump(titles, f)
     pbar.close()
 
     if errors:

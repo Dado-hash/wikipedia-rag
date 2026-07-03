@@ -5,3 +5,4 @@ chroma_db/
 articles.jsonl
 .DS_Store
 enwiki-latest-pages-articles.xml.bz2
+processed_titles.json
