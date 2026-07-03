@@ -1,6 +1,13 @@
 LM_STUDIO_URL = "http://localhost:1234/v1"
 EMBEDDING_MODEL = "text-embedding-all-minilm-l6-v2-embedding"
-CHAT_MODEL = "google/gemma-4-12b-qat"
+
+AVAILABLE_CHAT_MODELS = [
+    "google/gemma-4-12b-qat",
+    "liquid/lfm2.5-1.2b",
+    "nvidia/nemotron-3-nano-4b",
+    "google/gemma-4-e2b",
+]
+DEFAULT_CHAT_MODEL = AVAILABLE_CHAT_MODELS[0]
 
 CHUNK_SIZE = 2000
 CHUNK_OVERLAP = 200

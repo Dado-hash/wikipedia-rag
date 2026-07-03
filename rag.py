@@ -7,7 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
 
-def build_rag_chain():
+def build_retriever():
     if config.USE_LOCAL_EMBEDDING:
         embeddings = LocalEmbeddings(use_fp16=config.EMBEDDING_USE_FP16)
     else:
@@ -21,12 +21,19 @@ def build_rag_chain():
         persist_directory=config.CHROMA_DB_DIR,
     )
 
-    retriever = vectorstore.as_retriever(
+    return vectorstore.as_retriever(
         search_kwargs={'k': config.TOP_K},
     )
 
+
+def build_rag_chain(retriever=None, model_name=None):
+    if retriever is None:
+        retriever = build_retriever()
+    if model_name is None:
+        model_name = config.DEFAULT_CHAT_MODEL
+
     llm = ChatOpenAI(
-        model=config.CHAT_MODEL,
+        model=model_name,
         base_url=config.LM_STUDIO_URL,
         api_key='not-needed',
         temperature=0.3,

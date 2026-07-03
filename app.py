@@ -2,14 +2,23 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
 
 import streamlit as st
-from rag import build_rag_chain
+import config
+from rag import build_retriever, build_rag_chain
+
+@st.cache_resource
+def get_retriever():
+    return build_retriever()
 
 st.set_page_config(page_title='Wikipedia RAG', layout='centered')
 st.title('Wikipedia RAG')
 
-if 'chain' not in st.session_state:
-    with st.spinner('Loading RAG chain...'):
-        st.session_state.chain = build_rag_chain()
+model_name = st.sidebar.selectbox('Modello', config.AVAILABLE_CHAT_MODELS)
+
+if 'chain' not in st.session_state or st.session_state.get('model_name') != model_name:
+    with st.spinner(f'Caricamento modello: {model_name}...'):
+        retriever = get_retriever()
+        st.session_state.chain = build_rag_chain(retriever=retriever, model_name=model_name)
+        st.session_state.model_name = model_name
 
 query = st.text_input('Ask a question:', placeholder='e.g. Who was Abraham Lincoln?')
 
