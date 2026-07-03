@@ -4,7 +4,7 @@
 Pipeline (parallel):
   producer thread  ->  read JSONL + chunk + skip-already-embedded
   embed worker(s)  ->  embed_documents() (runs on MPS / CPU / ONNX)
-  main (store)     ->  drain + upsert to ChromaDB every STORAGE_FLUSH_SIZE chunks
+  store thread     ->  drain + upsert to ChromaDB every flush_size chunks
 
 Resume: chunk ids are deterministic (hash(title) :: chunk_index), so re-runs
 skip articles that are already present in the collection. `--reset` wipes first.
@@ -35,12 +35,12 @@ def stable_hash(title: str) -> str:
     return hashlib.blake2b(title.encode("utf-8"), digest_size=16).hexdigest()
 
 
-def build_embedder():
+def build_embedder(batch_size=None):
     if config.USE_LOCAL_EMBEDDING:
         return LocalEmbeddings(
             use_fp16=config.EMBEDDING_USE_FP16,
             backend=getattr(config, "EMBEDDING_BACKEND", "torch"),
-            encode_batch_size=config.EMBEDDING_BATCH_SIZE,
+            encode_batch_size=batch_size or config.EMBEDDING_BATCH_SIZE,
         )
     return LMStudioEmbeddings(model=config.EMBEDDING_MODEL, base_url=config.LM_STUDIO_URL)
 
@@ -72,7 +72,14 @@ def main():
     parser = argparse.ArgumentParser(description="Chunk articles, embed, store in ChromaDB")
     parser.add_argument("--reset", action="store_true",
                         help="Delete existing chroma_db and re-index from scratch")
+    parser.add_argument("--encode-batch-size", type=int, default=None,
+                        help=f"Override EMBEDDING_BATCH_SIZE (default {config.EMBEDDING_BATCH_SIZE})")
+    parser.add_argument("--flush-size", type=int, default=None,
+                        help=f"Override STORAGE_FLUSH_SIZE (default {config.STORAGE_FLUSH_SIZE})")
     args = parser.parse_args()
+
+    batch_size = args.encode_batch_size or config.EMBEDDING_BATCH_SIZE
+    flush_size = args.flush_size or config.STORAGE_FLUSH_SIZE
 
     processed_file = "processed_titles.json"
     if args.reset:
@@ -94,7 +101,7 @@ def main():
     )
 
     print("Loading embedder...")
-    embedder = build_embedder()
+    embedder = build_embedder(batch_size=batch_size)
 
     client = chromadb.PersistentClient(path=config.CHROMA_DB_DIR)
     collection = client.get_or_create_collection("langchain")
@@ -116,9 +123,10 @@ def main():
 
     qmax = getattr(config, "QUEUE_MAXSIZE", 4)
     batch_q = queue.Queue(maxsize=qmax)
-    store_q = queue.Queue(maxsize=qmax)
+    store_q = queue.Queue(maxsize=qmax * 2)  # ponytail: larger store_q since flush is async
     errors = []
 
+    chunks_done = 0
     pbar = tqdm(total=n_articles, unit="art", desc="Indexing")
     start = time.time()
 
@@ -145,7 +153,7 @@ def main():
                     continue
                 for idx, t in enumerate(texts):
                     batch.append((f"{title_hash}::{idx}", title, url, t))
-                    if len(batch) >= config.EMBEDDING_BATCH_SIZE:
+                    if len(batch) >= batch_size:
                         batch_q.put(batch)
                         batch = []
                 pbar.update(1)
@@ -165,49 +173,56 @@ def main():
         t.start()
         workers.append(t)
 
-    # --- Main: store (drain store_q, flush every STORAGE_FLUSH_SIZE) ---
-    flush_size = getattr(config, "STORAGE_FLUSH_SIZE", 5000)
-    s_ids, s_metas, s_docs, s_vecs = [], [], [], []
-    chunks_done = 0
-    sentinels_seen = 0
+    # --- Store thread: drain store_q, flush every flush_size chunks ---
+    def run_store():
+        nonlocal chunks_done
+        MAX_UPSERT = 5000  # ponytail: ChromaDB max batch ~5461, stay safe
 
-    def flush():
-        if not s_ids:
-            return
-        collection.upsert(
-            ids=s_ids,
-            embeddings=np.vstack(s_vecs),
-            metadatas=s_metas,
-            documents=s_docs,
-        )
-        with processed_lock:
-            for cid in s_ids:
-                processed_titles.add(cid.split("::")[0])
-        with open(processed_file, "w") as f:
+        def do_upsert(ids, metas, docs, vecs):
+            all_vecs = np.vstack(vecs)
+            for i in range(0, len(ids), MAX_UPSERT):
+                end = i + MAX_UPSERT
+                collection.upsert(
+                    ids=ids[i:end],
+                    embeddings=all_vecs[i:end],
+                    metadatas=metas[i:end],
+                    documents=docs[i:end],
+                )
             with processed_lock:
-                titles = sorted(processed_titles)
-            json.dump(titles, f)
-        s_ids.clear(); s_metas.clear(); s_docs.clear(); s_vecs.clear()
+                for cid in ids:
+                    processed_titles.add(cid.split("::")[0])
+            with open(processed_file, "w") as f:
+                with processed_lock:
+                    titles = sorted(processed_titles)
+                json.dump(titles, f)
 
-    while sentinels_seen < n_workers:
-        item = store_q.get()
-        if item is None:
-            sentinels_seen += 1
-            continue
-        ids, metas, docs, vectors = item
-        s_ids.extend(ids)
-        s_metas.extend(metas)
-        s_docs.extend(docs)
-        s_vecs.append(vectors)
-        chunks_done += len(ids)
-        if len(s_ids) >= flush_size:
-            flush()
+        s_ids, s_metas, s_docs, s_vecs = [], [], [], []
+        sentinels_seen = 0
+        while sentinels_seen < n_workers:
+            item = store_q.get()
+            if item is None:
+                sentinels_seen += 1
+                continue
+            ids, metas, docs, vectors = item
+            s_ids.extend(ids)
+            s_metas.extend(metas)
+            s_docs.extend(docs)
+            s_vecs.append(vectors)
+            chunks_done += len(ids)
+            if len(s_ids) >= flush_size:
+                do_upsert(s_ids, s_metas, s_docs, s_vecs)
+                s_ids.clear(); s_metas.clear(); s_docs.clear(); s_vecs.clear()
+        if s_ids:
+            do_upsert(s_ids, s_metas, s_docs, s_vecs)
 
-    flush()  # final partial batch
+    s_thread = threading.Thread(target=run_store, name="store")
+    s_thread.start()
+
     p_thread.join()
-    # Persist any entries learned by the producer (articles whose
-    # last chunk was already in the collection but whose hash wasn't
-    # yet in processed_titles).
+    for w in workers:
+        w.join()
+    s_thread.join()
+
     with open(processed_file, "w") as f:
         with processed_lock:
             titles = sorted(processed_titles)

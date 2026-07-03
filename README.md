@@ -31,13 +31,22 @@ Estrae articoli da `enwiki-latest-pages-articles.xml.bz2`, pulisce il wikitext, 
 
 ```bash
 python3 index.py --reset
+python3 index.py --encode-batch-size=1024 --flush-size=2000   # tuning
 ```
 
-- **Chunking**: `RecursiveCharacterTextSplitter` (800 caratteri, overlap 100)
+- **Chunking**: `RecursiveCharacterTextSplitter` (2000 caratteri, overlap 200)
+- **Pipeline**: 3 thread in cascata — producer → embed worker → store thread (dedicato, upsert non blocca la pipeline)
 - **Embedding**: sentence-transformers (`all-MiniLM-L6-v2`) via MPS (GPU Apple Silicon) — ~300-500 chunk/s
-- **Storage**: ChromaDB bulk insert (two-phase: prima embed, poi store)
+- **Storage**: ChromaDB upsert batch ogni `flush_size` chunk
 
-Usa `--reset` per ricreare l'indice da capo.
+CLI disponibili:
+- `--reset`: ricrea l'indice da capo
+- `--encode-batch-size N`: sovrascrive `EMBEDDING_BATCH_SIZE` (default 512)
+- `--flush-size N`: sovrascrive `STORAGE_FLUSH_SIZE` (default 5000)
+
+> **Tuning**: la configurazione più veloce finora è `--encode-batch-size=2048 --flush-size=10000`.
+> ChromaDB ha un limite di ~5461 elementi per UPSERT, quindi flush anche più grandi vengono
+> automaticamente suddivisi in blocchi da 5000 dal thread store.
 
 ### 3. Launch the UI
 
@@ -56,8 +65,15 @@ Tutti i parametri in `config.py`:
 | `LM_STUDIO_URL` | `http://localhost:1234/v1` | Solo per chat LLM |
 | `CHAT_MODEL` | `google/gemma-4-12b-qat` | Modello per risposte |
 | `USE_LOCAL_EMBEDDING` | `True` | Usa sentence-transformers (MPS) invece di LM Studio API |
-| `CHUNK_SIZE` | `800` | Caratteri per chunk |
+| `EMBEDDING_BATCH_SIZE` | `512` | Batch per producer + SentenceTransformer encode |
+| `EMBEDDING_BACKEND` | `"torch"` | `"torch"` o `"onnx"` (più veloce su CPU) |
+| `EMBEDDING_USE_FP16` | `True` | Mezza precisione su MPS |
+| `CHUNK_SIZE` | `2000` | Caratteri per chunk |
+| `CHUNK_OVERLAP` | `200` | Overlap tra chunk consecutivi |
 | `TOP_K` | `5` | Documenti recuperati per query |
+| `PARALLEL_EMBED_WORKERS` | `1` | Thread embed (tenere 1, MPS non multi-processa bene) |
+| `QUEUE_MAXSIZE` | `4` | Code graduate tra stadi (backpressure) |
+| `STORAGE_FLUSH_SIZE` | `5000` | Upsert in ChromaDB ogni N chunk |
 
 ## Performance (M1 Mac, 5000 articoli, ~194k chunk)
 
@@ -73,7 +89,7 @@ Tutti i parametri in `config.py`:
 ├── config.py        # LM Studio URL, chunk params, flag embedding
 ├── embeddings.py    # LMStudioEmbeddings + LocalEmbeddings (MPS)
 ├── ingest.py        # Extract articles from Wikipedia dump
-├── index.py         # Two-phase: embed all, then bulk store in ChromaDB
+├── index.py         # Pipeline parallela: producer → embed → store thread
 ├── rag.py           # LangChain RAG chain
 ├── app.py           # Streamlit UI
 ├── articles.jsonl   # Extracted articles (generated)
