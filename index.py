@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Chunk articles, embed, and store in ChromaDB.
+"""Chunk articles, embed, and store in the configured vector store.
 
 Pipeline (parallel):
   producer thread  ->  read JSONL + chunk + skip-already-embedded
-  embed worker(s)  ->  embed_documents() (runs on MPS / CPU / ONNX)
-  store thread     ->  drain + upsert to ChromaDB every flush_size chunks
+  embed worker(s)  ->  embed_documents() (runs on MPS / CPU)
+  store thread     ->  drain + flush every flush_size chunks
 
+Supports ChromaDB (legacy) and FAISS+sqlite (faster bulk builds).
 Resume: chunk ids are deterministic (hash(title) :: chunk_index), so re-runs
-skip articles that are already present in the collection. `--reset` wipes first.
+skip articles that are already present. `--reset` wipes first.
 """
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
@@ -18,10 +19,12 @@ import json
 import os
 import queue
 import shutil
+import sqlite3
 import threading
 import time
 
 import chromadb
+import faiss
 import numpy as np
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from tqdm import tqdm
@@ -35,14 +38,53 @@ def stable_hash(title: str) -> str:
     return hashlib.blake2b(title.encode("utf-8"), digest_size=16).hexdigest()
 
 
-def build_embedder(batch_size=None):
+def build_embedder(model_name=None, batch_size=None):
     if config.USE_LOCAL_EMBEDDING:
         return LocalEmbeddings(
+            model_name=model_name or config.EMBEDDING_MODEL_NAME,
             use_fp16=config.EMBEDDING_USE_FP16,
-            backend=getattr(config, "EMBEDDING_BACKEND", "torch"),
             encode_batch_size=batch_size or config.EMBEDDING_BATCH_SIZE,
         )
     return LMStudioEmbeddings(model=config.EMBEDDING_MODEL, base_url=config.LM_STUDIO_URL)
+
+
+def _init_faiss_index(embedder, reset=False):
+    """Load an existing FAISS index or build a new one."""
+    os.makedirs(config.VECTOR_STORE_DIR, exist_ok=True)
+    dim = embedder.model.get_sentence_embedding_dimension()
+
+    if not reset and os.path.exists(config.FAISS_INDEX_FILE):
+        index = faiss.read_index(config.FAISS_INDEX_FILE)
+        print(f"Loaded FAISS index with {index.ntotal} vectors")
+        return index
+
+    if getattr(config, "FAISS_USE_HNSW", True):
+        index = faiss.IndexHNSWFlat(dim, config.FAISS_HNSW_M)
+        index.hnsw.efConstruction = config.FAISS_HNSW_EF_CONSTRUCTION
+    else:
+        index = faiss.IndexFlatIP(dim)
+    print(f"Created new FAISS index (dim={dim})")
+    return index
+
+
+def _init_faiss_metadata(reset=False):
+    """Create the metadata DB if needed and return existing chunk ids."""
+    os.makedirs(config.VECTOR_STORE_DIR, exist_ok=True)
+    conn = sqlite3.connect(config.METADATA_DB_FILE)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS docs ("
+            "id TEXT PRIMARY KEY, title TEXT, url TEXT, text TEXT)"
+        )
+        conn.commit()
+        existing_ids = set()
+        if not reset:
+            rows = conn.execute("SELECT id FROM docs").fetchall()
+            existing_ids = {r[0] for r in rows}
+            print(f"Resume: {len(existing_ids)} chunks already in FAISS metadata")
+    finally:
+        conn.close()
+    return existing_ids
 
 
 def embed_worker(in_q, out_q, embedder, errors):
@@ -69,9 +111,9 @@ def embed_worker(in_q, out_q, embedder, errors):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Chunk articles, embed, store in ChromaDB")
+    parser = argparse.ArgumentParser(description="Chunk articles, embed, store")
     parser.add_argument("--reset", action="store_true",
-                        help="Delete existing chroma_db and re-index from scratch")
+                        help="Delete vector store and re-index from scratch")
     parser.add_argument("--encode-batch-size", type=int, default=None,
                         help=f"Override EMBEDDING_BATCH_SIZE (default {config.EMBEDDING_BATCH_SIZE})")
     parser.add_argument("--flush-size", type=int, default=None,
@@ -80,18 +122,23 @@ def main():
                         help=f"HNSW ef_construction (default {config.HNSW_EF_CONSTRUCTION}, lower=faster insert)")
     parser.add_argument("--save-interval", type=int, default=None,
                         help=f"Save processed_titles every N flushes (default {config.SAVE_INTERVAL})")
+    parser.add_argument("--vector-store", choices=["chroma", "faiss"], default=config.VECTOR_STORE,
+                        help=f"Vector store backend (default {config.VECTOR_STORE})")
     args = parser.parse_args()
 
     batch_size = args.encode_batch_size or config.EMBEDDING_BATCH_SIZE
     flush_size = args.flush_size or config.STORAGE_FLUSH_SIZE
-    hnsw_ef = args.hnsw_ef if args.hnsw_ef is not None else config.HNSW_EF_CONSTRUCTION
     save_interval = args.save_interval if args.save_interval is not None else config.SAVE_INTERVAL
+    vector_store = args.vector_store
 
     processed_file = "processed_titles.json"
     if args.reset:
-        if os.path.exists(config.CHROMA_DB_DIR):
+        if vector_store == "chroma" and os.path.exists(config.CHROMA_DB_DIR):
             shutil.rmtree(config.CHROMA_DB_DIR)
             print(f"Deleted {config.CHROMA_DB_DIR}/")
+        if vector_store == "faiss" and os.path.exists(config.VECTOR_STORE_DIR):
+            shutil.rmtree(config.VECTOR_STORE_DIR)
+            print(f"Deleted {config.VECTOR_STORE_DIR}/")
         if os.path.exists(processed_file):
             os.remove(processed_file)
             print(f"Deleted {processed_file}")
@@ -109,18 +156,26 @@ def main():
     print("Loading embedder...")
     embedder = build_embedder(batch_size=batch_size)
 
-    client = chromadb.PersistentClient(path=config.CHROMA_DB_DIR)
-    collection = client.get_or_create_collection(
-        "langchain",
-        metadata={"hnsw:construction_ef": hnsw_ef},
-    )
-
-    # Load existing chunk ids once: lets us skip already-embedded articles on resume.
+    # --- Backend init ---
     existing_ids = set()
-    if not args.reset:
-        fetched = collection.get(include=[])
-        existing_ids = set(fetched.get("ids", []))
-        print(f"Resume: {len(existing_ids)} chunks already in collection")
+    if vector_store == "chroma":
+        hnsw_ef = args.hnsw_ef if args.hnsw_ef is not None else config.HNSW_EF_CONSTRUCTION
+        client = chromadb.PersistentClient(path=config.CHROMA_DB_DIR)
+        collection = client.get_or_create_collection(
+            "langchain",
+            metadata={"hnsw:construction_ef": hnsw_ef},
+        )
+        if not args.reset:
+            fetched = collection.get(include=[])
+            existing_ids = set(fetched.get("ids", []))
+            print(f"Resume: {len(existing_ids)} chunks already in collection")
+        faiss_index = None
+        faiss_conn = None
+    else:  # faiss
+        faiss_index = _init_faiss_index(embedder, reset=args.reset)
+        existing_ids = _init_faiss_metadata(reset=args.reset)
+        collection = None
+        client = None
 
     # Load processed titles cache to avoid re-splitting on resume.
     processed_titles = set()
@@ -150,16 +205,17 @@ def main():
                 title = art["title"]
                 url = art["url"]
                 title_hash = stable_hash(title)
-                with processed_lock:
-                    if title_hash in processed_titles:
-                        pbar.update(1)
-                        continue
                 texts = splitter.split_text(art["text"])
                 if texts and f"{title_hash}::{len(texts) - 1}" in existing_ids:
+                    # Full article is already stored; refresh the cache and skip.
                     with processed_lock:
                         processed_titles.add(title_hash)
                     pbar.update(1)
                     continue
+                with processed_lock:
+                    if title_hash in processed_titles:
+                        pbar.update(1)
+                        continue
                 for idx, t in enumerate(texts):
                     batch.append((f"{title_hash}::{idx}", title, url, t))
                     if len(batch) >= batch_size:
@@ -194,9 +250,17 @@ def main():
                     titles = sorted(processed_titles)
                 json.dump(titles, f)
 
-        def do_upsert(ids, metas, docs, vecs):
+        def mark_processed_and_save(ids):
             nonlocal flush_count
-            all_vecs = np.vstack(vecs)
+            with processed_lock:
+                for cid in ids:
+                    processed_titles.add(cid.split("::")[0])
+            flush_count += 1
+            if flush_count % save_interval == 0:
+                save_processed()
+
+        def do_upsert_chroma(ids, metas, docs, vecs):
+            all_vecs = np.vstack(vecs).astype(np.float32, copy=False)
             for i in range(0, len(ids), MAX_UPSERT):
                 end = i + MAX_UPSERT
                 collection.upsert(
@@ -205,12 +269,26 @@ def main():
                     metadatas=metas[i:end],
                     documents=docs[i:end],
                 )
-            with processed_lock:
-                for cid in ids:
-                    processed_titles.add(cid.split("::")[0])
-            flush_count += 1
-            if flush_count % save_interval == 0:
-                save_processed()
+            mark_processed_and_save(ids)
+
+        def do_upsert_faiss(ids, metas, docs, vecs):
+            all_vecs = np.vstack(vecs).astype(np.float32, copy=False)
+            # Normalize for cosine similarity via inner product.
+            faiss.normalize_L2(all_vecs)
+            faiss_index.add(all_vecs)
+            conn = sqlite3.connect(config.METADATA_DB_FILE)
+            try:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO docs VALUES (?, ?, ?, ?)",
+                    [(cid, m["title"], m["url"], d) for cid, m, d in zip(ids, metas, docs)],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            faiss.write_index(faiss_index, config.FAISS_INDEX_FILE)
+            mark_processed_and_save(ids)
+
+        do_upsert = do_upsert_chroma if vector_store == "chroma" else do_upsert_faiss
 
         s_ids, s_metas, s_docs, s_vecs = [], [], [], []
         sentinels_seen = 0

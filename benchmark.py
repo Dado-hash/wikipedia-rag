@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""Benchmark embedding backends and batch sizes to pick the fastest config.
+"""Benchmark embedding batch sizes to pick the fastest config.
 
-Samples real chunks from articles.jsonl, then times `embed_documents()` across:
-  - backends:   torch (MPS/CPU), onnx (CPU)  [onnx only if installed]
-  - batch sizes: from --batch-sizes (default 64,128,256,512)
-
-Prints a chunks/s table. Does NOT write to ChromaDB.
+Samples real chunks from articles.jsonl, then times `embed_documents()` across
+the configured embedding model and a set of batch sizes.
 
 Usage:
-    python benchmark.py                       # sample 1000 chunks, default batches
-    python benchmark.py --n 2000 --batch-sizes 32 64 128 256 512
-    python benchmark.py --skip-onnx           # torch-only run
+    python benchmark.py                       # 1000 chunks, default batch sizes
+    python benchmark.py --n 2000 --batch-sizes 512 1024 2048 4096
+    python benchmark.py --model sentence-transformers/all-MiniLM-L6-v2
 """
 import argparse
 import time
@@ -38,13 +35,13 @@ def sample_chunks(n):
     return chunks[:n]
 
 
-def time_backend(backend, batch_size, texts, rounds=2):
+def time_backend(model_name, batch_size, texts, rounds=2):
     emb = LocalEmbeddings(
-        backend=backend,
+        model_name=model_name,
         use_fp16=config.EMBEDDING_USE_FP16,
         encode_batch_size=batch_size,
     )
-    device = "mps" if backend == "torch" else "cpu"
+    device = "mps" if emb.model.device.type == "mps" else "cpu"
     # warmup (first run pays model load / kernel compile)
     emb.embed_documents(texts[:batch_size])
     best = float("inf")
@@ -57,41 +54,33 @@ def time_backend(backend, batch_size, texts, rounds=2):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark embedding backends & batch sizes")
+    parser = argparse.ArgumentParser(description="Benchmark embedding batch sizes")
     parser.add_argument("--n", type=int, default=1000, help="number of chunks to sample")
-    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[64, 128, 256, 512])
-    parser.add_argument("--skip-onnx", action="store_true", help="do not test the ONNX backend")
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[512, 1024, 2048])
+    parser.add_argument("--model", default=config.EMBEDDING_MODEL_NAME, help="embedding model to benchmark")
     args = parser.parse_args()
 
     print(f"Sampling {args.n} chunks from {config.ARTICLES_FILE} ...")
     texts = sample_chunks(args.n)
-    print(f"Sampled {len(texts)} chunks (chunk_size={config.CHUNK_SIZE})\n")
+    print(f"Sampled {len(texts)} chunks (chunk_size={config.CHUNK_SIZE}, model={args.model})\n")
 
-    backends = ["torch"]
-    if not args.skip_onnx:
-        try:
-            import onnxruntime  # noqa: F401
-            backends.append("onnx")
-        except ImportError:
-            print("onnxruntime not installed -> skipping ONNX (pip install onnxruntime optimum)\n")
-
-    print(f"{'backend':<10} {'device':<8} {'batch':<8} {'secs':>8} {'chunks/s':>12}")
-    print("-" * 50)
+    print(f"{'model':<45s} {'device':<8s} {'batch':<8s} {'secs':>8s} {'chunks/s':>12s}")
+    print("-" * 75)
     results = {}
-    for backend in backends:
-        for bs in args.batch_sizes:
-            try:
-                secs, rate, device = time_backend(backend, bs, texts)
-            except Exception as e:  # noqa: BLE001
-                print(f"{backend:<10} {'-':<8} {bs:<8} {'ERROR':>8} {e}")
-                continue
-            print(f"{backend:<10} {device:<8} {bs:<8} {secs:>8.2f} {rate:>12.0f}")
-            results[(backend, bs)] = rate
+    for bs in args.batch_sizes:
+        try:
+            secs, rate, device = time_backend(args.model, bs, texts)
+        except Exception as e:  # noqa: BLE001
+            print(f"{args.model:<45s} {'-':<8s} {bs:<8d} {'ERROR':>8s} {e}")
+            continue
+        print(f"{args.model:<45s} {device:<8s} {bs:<8d} {secs:>8.2f} {rate:>12.0f}")
+        results[bs] = rate
 
     if results:
-        (best_key, best_rate) = max(results.items(), key=lambda kv: kv[1])
-        print(f"\nFastest: backend={best_key[0]} batch_size={best_key[1]} -> {best_rate:.0f} chunks/s")
-        print(f"Set in config.py: EMBEDDING_BACKEND = \"{best_key[0]}\", EMBEDDING_BATCH_SIZE = {best_key[1]}")
+        best_bs = max(results, key=results.get)
+        best_rate = results[best_bs]
+        print(f"\nFastest: batch_size={best_bs} -> {best_rate:.0f} chunks/s")
+        print(f"Set in config.py: EMBEDDING_BATCH_SIZE = {best_bs}")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 chroma_db/
+vector_store/
 articles.jsonl
 .DS_Store
 enwiki-latest-pages-articles.xml.bz2
