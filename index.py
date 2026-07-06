@@ -23,10 +23,13 @@ import sqlite3
 import threading
 import time
 
+import pickle
+
 import chromadb
 import faiss
 import numpy as np
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from rank_bm25 import BM25Okapi
 from tqdm import tqdm
 
 import config
@@ -49,21 +52,20 @@ def build_embedder(model_name=None, batch_size=None):
 
 
 def _init_faiss_index(embedder, reset=False):
-    """Load an existing FAISS index or build a new one."""
+    """Load an existing FAISS index or build a new IndexIDMap."""
     os.makedirs(config.VECTOR_STORE_DIR, exist_ok=True)
     dim = embedder.model.get_sentence_embedding_dimension()
 
     if not reset and os.path.exists(config.FAISS_INDEX_FILE):
         index = faiss.read_index(config.FAISS_INDEX_FILE)
-        print(f"Loaded FAISS index with {index.ntotal} vectors")
+        kind = "IDMap" if isinstance(index, faiss.IndexIDMap) else "legacy"
+        print(f"Loaded FAISS {kind} index with {index.ntotal} vectors")
         return index
 
-    if getattr(config, "FAISS_USE_HNSW", True):
-        index = faiss.IndexHNSWFlat(dim, config.FAISS_HNSW_M)
-        index.hnsw.efConstruction = config.FAISS_HNSW_EF_CONSTRUCTION
-    else:
-        index = faiss.IndexFlatIP(dim)
-    print(f"Created new FAISS index (dim={dim})")
+    base = faiss.IndexHNSWFlat(dim, config.FAISS_HNSW_M)
+    base.hnsw.efConstruction = config.FAISS_HNSW_EF_CONSTRUCTION
+    index = faiss.IndexIDMap(base)
+    print(f"Created new FAISS IDMap index (dim={dim})")
     return index
 
 
@@ -74,9 +76,16 @@ def _init_faiss_metadata(reset=False):
     try:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS docs ("
-            "id TEXT PRIMARY KEY, title TEXT, url TEXT, text TEXT)"
+            "id TEXT PRIMARY KEY, title TEXT, url TEXT, text TEXT, "
+            "faiss_id INTEGER)"
         )
         conn.commit()
+        # Migrate legacy DBs that lack the faiss_id column.
+        try:
+            conn.execute("ALTER TABLE docs ADD COLUMN faiss_id INTEGER")
+            conn.commit()
+        except Exception:
+            pass
         existing_ids = set()
         if not reset:
             rows = conn.execute("SELECT id FROM docs").fetchall()
@@ -239,6 +248,9 @@ def main():
         workers.append(t)
 
     # --- Store thread: drain store_q, flush every flush_size chunks ---
+    # FAISS ID counter: resume from existing index size.
+    faiss_id_counter = [faiss_index.ntotal if vector_store == "faiss" and faiss_index else 0]
+
     def run_store():
         nonlocal chunks_done
         MAX_UPSERT = 5000  # ponytail: ChromaDB max batch ~5461, stay safe
@@ -272,15 +284,25 @@ def main():
             mark_processed_and_save(ids)
 
         def do_upsert_faiss(ids, metas, docs, vecs):
+            nonlocal faiss_id_counter
             all_vecs = np.vstack(vecs).astype(np.float32, copy=False)
-            # Normalize for cosine similarity via inner product.
             faiss.normalize_L2(all_vecs)
-            faiss_index.add(all_vecs)
+            n = len(ids)
+            if isinstance(faiss_index, faiss.IndexIDMap):
+                faiss_ids = np.arange(faiss_id_counter[0], faiss_id_counter[0] + n, dtype=np.int64)
+                faiss_index.add_with_ids(all_vecs, faiss_ids)
+                stored_ids = faiss_ids.tolist()
+            else:
+                # Legacy path: plain IndexHNSWFlat, position-based mapping.
+                faiss_index.add(all_vecs)
+                stored_ids = list(range(faiss_id_counter[0], faiss_id_counter[0] + n))
+            faiss_id_counter[0] += n
             conn = sqlite3.connect(config.METADATA_DB_FILE)
             try:
                 conn.executemany(
-                    "INSERT OR REPLACE INTO docs VALUES (?, ?, ?, ?)",
-                    [(cid, m["title"], m["url"], d) for cid, m, d in zip(ids, metas, docs)],
+                    "INSERT OR REPLACE INTO docs(id, title, url, text, faiss_id) VALUES (?, ?, ?, ?, ?)",
+                    [(cid, m["title"], m["url"], d, int(fid))
+                     for cid, m, d, fid in zip(ids, metas, docs, stored_ids)],
                 )
                 conn.commit()
             finally:
@@ -329,6 +351,22 @@ def main():
     total = time.time() - start
     rate = chunks_done / total if total else 0
     print(f"Done! {chunks_done} chunks embedded+stored in {total:.1f}s ({rate:.0f} chunks/s)")
+
+    # Build BM25 index for hybrid search (FAISS backend only).
+    if vector_store == "faiss" and config.ENABLE_HYBRID_SEARCH:
+        print("Building BM25 index...")
+        conn = sqlite3.connect(config.METADATA_DB_FILE)
+        rows = conn.execute("SELECT text FROM docs ORDER BY faiss_id").fetchall()
+        conn.close()
+        tokenized = [row[0].split() for row in rows]
+        if tokenized:
+            bm25 = BM25Okapi(tokenized)
+            bm25_path = os.path.join(config.VECTOR_STORE_DIR, "bm25_index.pkl")
+            with open(bm25_path, "wb") as f:
+                pickle.dump(bm25, f)
+            print(f"BM25 index saved: {len(rows)} docs → {bm25_path}")
+        else:
+            print("Skipping BM25: no documents in metadata.")
 
 
 if __name__ == "__main__":

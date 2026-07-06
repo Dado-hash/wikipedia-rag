@@ -14,6 +14,19 @@ st.title('Wikipedia RAG')
 
 model_name = st.sidebar.selectbox('Modello', config.AVAILABLE_CHAT_MODELS)
 
+st.sidebar.markdown('### Techniques')
+badges = []
+if config.ENABLE_HYDE:
+    badges.append('🔄 HyDE')
+if config.ENABLE_HYBRID_SEARCH:
+    badges.append('⚡ Hybrid')
+if config.ENABLE_RERANKING:
+    badges.append('🎯 Re-rank')
+if badges:
+    st.sidebar.markdown(' '.join(f'`{b}`' for b in badges))
+else:
+    st.sidebar.markdown('`Dense only`')
+
 if 'chain' not in st.session_state or st.session_state.get('model_name') != model_name:
     with st.spinner(f'Caricamento modello: {model_name}...'):
         retriever = get_retriever()

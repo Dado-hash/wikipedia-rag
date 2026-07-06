@@ -48,3 +48,17 @@ STORAGE_FLUSH_SIZE = 5000    # vectors per store flush
 
 # Persist processed_titles cache to disk every N flushes (reduce lock / I/O pressure).
 SAVE_INTERVAL = 5
+
+# ── Advanced RAG techniques (Fase 1) ────────────────────────────────────────
+# Toggle each technique independently.  They compose as:
+#   HyDE( query → LLM → hypothetical doc → embedding )  [if ENABLE_HYDE]
+#   → HybridSearch( FAISS + BM25 + RRF )                 [if ENABLE_HYBRID_SEARCH]
+#   → CrossEncoderReRank                                 [if ENABLE_RERANKING]
+ENABLE_HYDE = False           # Hypothetical Document Embedding
+ENABLE_HYBRID_SEARCH = True   # Dense (FAISS) + Sparse (BM25) + RRF fusion
+ENABLE_RERANKING = True       # Cross-encoder re-ranking on retrieved docs
+
+HYBRID_TOP_K = 15             # Retrieve N per method before fusion
+RRF_K = 60                    # RRF constant (higher = more weight to top ranks)
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+CROSS_ENCODER_TOP_K = 5      # Number of docs to keep after re-ranking
