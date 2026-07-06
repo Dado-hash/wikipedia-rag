@@ -147,6 +147,47 @@ def _rrf_merge(dense_docs: List[Document], bm25_docs: List[Document],
     return [item["doc"] for item in sorted_docs]
 
 
+def _enrich_context(docs: List[Document], window: int = None) -> List[Document]:
+    """Expand each retrieved doc with adjacent chunks from the same article."""
+    if window is None:
+        window = config.CONTEXT_WINDOW_SIZE
+    if not docs:
+        return docs
+    conn = sqlite3.connect(config.METADATA_DB_FILE)
+    try:
+        seen = set()
+        enriched = []
+        for doc in docs:
+            cid = doc.metadata.get("id", "")
+            parts = cid.split("::")
+            if len(parts) != 2:
+                if cid not in seen:
+                    seen.add(cid)
+                    enriched.append(doc)
+                continue
+            article_hash, chunk_idx = parts[0], int(parts[1])
+            rows = conn.execute(
+                "SELECT id, title, url, text FROM docs WHERE id LIKE ? ORDER BY id",
+                (f"{article_hash}::%",),
+            ).fetchall()
+            for row in rows:
+                row_id = row[0]
+                row_parts = row_id.split("::")
+                if len(row_parts) != 2:
+                    continue
+                row_idx = int(row_parts[1])
+                if abs(row_idx - chunk_idx) <= window:
+                    if row_id not in seen:
+                        seen.add(row_id)
+                        enriched.append(Document(
+                            page_content=row[3],
+                            metadata={"id": row[0], "title": row[1], "url": row[2]},
+                        ))
+        return enriched
+    finally:
+        conn.close()
+
+
 def _rerank_docs(query: str, docs: List[Document], top_k: int = None) -> List[Document]:
     """Re-rank documents with a cross-encoder."""
     if top_k is None:
@@ -219,6 +260,10 @@ def build_retriever(llm: BaseLanguageModel = None):
         # 4. Re-ranking with cross-encoder.
         if config.ENABLE_RERANKING and len(all_results) > 1:
             all_results = _rerank_docs(raw_query, all_results)
+
+        # 5. Context Enrichment: add adjacent chunks for coherence.
+        if config.ENABLE_CONTEXT_ENRICHMENT:
+            all_results = _enrich_context(all_results)
 
         # Trim to TOP_K when re-ranking isn't reducing the list.
         if len(all_results) > config.TOP_K and not config.ENABLE_RERANKING:

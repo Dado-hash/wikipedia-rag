@@ -62,3 +62,11 @@ HYBRID_TOP_K = 15             # Retrieve N per method before fusion
 RRF_K = 60                    # RRF constant (higher = more weight to top ranks)
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 CROSS_ENCODER_TOP_K = 5      # Number of docs to keep after re-ranking
+
+# ── Chunking & Embedding (Fase 2) ───────────────────────────────────────────
+# Contextual Chunk Headers are always active: the article title is prepended to
+# every chunk before embedding, so chunks about "the red planet" without
+# mentioning "Mars" are still retrieved for Mars queries.
+# Context Enrichment adds adjacent chunks around each retrieved chunk.
+ENABLE_CONTEXT_ENRICHMENT = False
+CONTEXT_WINDOW_SIZE = 1      # Number of chunks before/after each retrieved chunk

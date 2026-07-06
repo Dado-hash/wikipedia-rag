@@ -226,7 +226,10 @@ def main():
                         pbar.update(1)
                         continue
                 for idx, t in enumerate(texts):
-                    batch.append((f"{title_hash}::{idx}", title, url, t))
+                    # Contextual Chunk Header: prepend title so embedding captures
+                    # article-level context even for chunks that don't name it.
+                    header_text = f"Title: {title}\n{t}"
+                    batch.append((f"{title_hash}::{idx}", title, url, header_text))
                     if len(batch) >= batch_size:
                         batch_q.put(batch)
                         batch = []
@@ -358,7 +361,14 @@ def main():
         conn = sqlite3.connect(config.METADATA_DB_FILE)
         rows = conn.execute("SELECT text FROM docs ORDER BY faiss_id").fetchall()
         conn.close()
-        tokenized = [row[0].split() for row in rows]
+        # Strip the CCH header before tokenizing for BM25.
+        def strip_cch(text):
+            if text.startswith("Title: "):
+                nl = text.find("\n")
+                if nl != -1:
+                    return text[nl + 1:]
+            return text
+        tokenized = [strip_cch(row[0]).split() for row in rows]
         if tokenized:
             bm25 = BM25Okapi(tokenized)
             bm25_path = os.path.join(config.VECTOR_STORE_DIR, "bm25_index.pkl")
