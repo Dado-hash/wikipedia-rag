@@ -276,6 +276,30 @@ def build_retriever(llm: BaseLanguageModel = None):
 
 # ── RAG chain ────────────────────────────────────────────────────────────────
 
+def build_streaming_chain(model_name=None):
+    """Return a prompt→LLM chain that supports token-by-token streaming.
+
+    Input:  ``{"context": List[Document], "input": str}``
+    Output: iterator of ``AIMessageChunk`` objects (.content per chunk).
+    """
+    if model_name is None:
+        model_name = config.DEFAULT_CHAT_MODEL
+    llm = ChatOpenAI(
+        model=model_name,
+        base_url=config.LM_STUDIO_URL,
+        api_key="not-needed",
+        temperature=0.3,
+    )
+    prompt = ChatPromptTemplate.from_template(
+        "You are a helpful assistant that answers questions based on "
+        "the provided Wikipedia articles.\n\n"
+        "Context:\n{context}\n\n"
+        "Question: {input}\n\n"
+        "Answer concisely and cite the article titles you used as sources."
+    )
+    return prompt | llm
+
+
 def build_rag_chain(retriever=None, model_name=None):
     if model_name is None:
         model_name = config.DEFAULT_CHAT_MODEL

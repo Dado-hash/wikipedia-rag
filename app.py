@@ -3,7 +3,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
 
 import streamlit as st
 import config
-from rag import build_retriever, build_rag_chain
+from rag import build_retriever, build_streaming_chain
 
 @st.cache_resource
 def get_retriever():
@@ -27,26 +27,25 @@ if badges:
 else:
     st.sidebar.markdown('`Dense only`')
 
-if 'chain' not in st.session_state or st.session_state.get('model_name') != model_name:
-    with st.spinner(f'Caricamento modello: {model_name}...'):
-        retriever = get_retriever()
-        st.session_state.chain = build_rag_chain(retriever=retriever, model_name=model_name)
-        st.session_state.model_name = model_name
-
 query = st.text_input('Ask a question:', placeholder='e.g. Who was Abraham Lincoln?')
 
 if query:
+    retriever = get_retriever()
     with st.spinner('Searching Wikipedia...'):
-        result = st.session_state.chain.invoke({'input': query})
+        docs = retriever.invoke(query)
+
+    streaming_chain = build_streaming_chain(model_name=model_name)
 
     st.markdown('### Answer')
-    st.write(result['answer'])
+    st.write_stream(
+        chunk.content for chunk in streaming_chain.stream({"context": docs, "input": query})
+    )
 
-    with st.expander(f'Sources ({len(result["context"])})', expanded=False):
-        for i, doc in enumerate(result['context']):
+    with st.expander(f'Sources ({len(docs)})', expanded=False):
+        for i, doc in enumerate(docs):
             title = doc.metadata.get('title', '?')
             url = doc.metadata.get('url', '')
             st.markdown(f'**{i+1}. [{title}]({url})**')
             st.write(doc.page_content[:300] + '...')
-            if i < len(result['context']) - 1:
+            if i < len(docs) - 1:
                 st.divider()

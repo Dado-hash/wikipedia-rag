@@ -1,0 +1,17 @@
+[
+  {"query": "Who was Abraham Lincoln?", "difficulty": "easy", "topics": ["Abraham Lincoln"]},
+  {"query": "What is the capital of France?", "difficulty": "easy", "topics": ["France", "Paris"]},
+  {"query": "When did World War II end?", "difficulty": "easy", "topics": ["World War II"]},
+  {"query": "What is the chemical formula of water?", "difficulty": "easy", "topics": ["Water", "Chemical formula"]},
+  {"query": "Who wrote Romeo and Juliet?", "difficulty": "easy", "topics": ["William Shakespeare", "Romeo and Juliet"]},
+  {"query": "What is the speed of light in vacuum?", "difficulty": "easy", "topics": ["Speed of light"]},
+  {"query": "What are the main causes of climate change according to scientific consensus?", "difficulty": "medium", "topics": ["Climate change", "Greenhouse gas"]},
+  {"query": "How does photosynthesis work in plants?", "difficulty": "medium", "topics": ["Photosynthesis", "Plants"]},
+  {"query": "What is the difference between prokaryotic and eukaryotic cells?", "difficulty": "medium", "topics": ["Prokaryote", "Eukaryote", "Cell biology"]},
+  {"query": "What were the major consequences of the French Revolution?", "difficulty": "medium", "topics": ["French Revolution"]},
+  {"query": "How does the European Union make decisions and what are its main institutions?", "difficulty": "medium", "topics": ["European Union"]},
+  {"query": "Compare the causes and consequences of World War I and World War II", "difficulty": "hard", "topics": ["World War I", "World War II"]},
+  {"query": "How did the theory of evolution influence modern biology and our understanding of genetics?", "difficulty": "hard", "topics": ["Evolution", "Genetics", "Charles Darwin"]},
+  {"query": "What is the relationship between quantum mechanics and the standard model of particle physics?", "difficulty": "hard", "topics": ["Quantum mechanics", "Standard Model", "Particle physics"]},
+  {"query": "How did the Roman Empire transition from a republic to an imperial system, and what were the long-term effects on European governance?", "difficulty": "hard", "topics": ["Roman Empire", "Roman Republic", "Roman governance"]}
+]
